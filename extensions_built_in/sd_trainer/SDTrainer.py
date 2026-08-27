@@ -120,6 +120,24 @@ class SDTrainer(BaseSDTrainProcess):
 
     def before_model_load(self):
         pass
+
+    def get_blank_control_image(self):
+        # noise instead of a black image so the fallback does not read as a
+        # meaningful (solid black) reference
+        control_image = torch.rand((1, 3, 224, 224), device=self.sd.device_torch, dtype=self.sd.torch_dtype)
+        if self.sd.has_multiple_control_images:
+            control_image = [control_image]
+        return control_image
+
+    def encode_static_prompt(self, prompt, **kwargs):
+        # static embeds (blank/trigger/uncond/DOP class) are always plain text.
+        # Some models (edit models) cannot encode a prompt without control images
+        # and raise, only then fall back to a blank control image. Real errors
+        # surface on the fallback call.
+        try:
+            return self.sd.encode_prompt(prompt, **kwargs)
+        except Exception:
+            return self.sd.encode_prompt(prompt, control_images=self.get_blank_control_image(), **kwargs)
     
     def cache_sample_prompts(self):
         if self.train_config.disable_sampling:
@@ -154,10 +172,20 @@ class SDTrainer(BaseSDTrainProcess):
                     has_control_images = True
                 # see if we need to encode the control images
                 if self.sd.encode_control_in_text_embeddings and has_control_images:
+                    self.sd.prepare_sample_prompt_context(gen_img_config)
                     
+                    video_exts = ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']
+
+                    def _is_ctrl_video(pth):
+                        return os.path.splitext(str(pth))[1].lower() in video_exts
+
                     ctrl_img_list = []
                     
-                    if gen_img_config.ctrl_img is not None:
+                    if gen_img_config.ctrl_img is not None and _is_ctrl_video(gen_img_config.ctrl_img):
+                        # control VIDEO: pass the path through; models with
+                        # supports_video_control_images handle it in get_prompt_embeds
+                        ctrl_img_list.append(str(gen_img_config.ctrl_img))
+                    elif gen_img_config.ctrl_img is not None:
                         ctrl_img = Image.open(gen_img_config.ctrl_img).convert("RGB")
                         # convert to 0 to 1 tensor
                         ctrl_img = (
@@ -167,7 +195,11 @@ class SDTrainer(BaseSDTrainProcess):
                         )
                         ctrl_img_list.append(ctrl_img)
                     
-                    if gen_img_config.ctrl_img_1 is not None:
+                    if gen_img_config.ctrl_img_1 is not None and _is_ctrl_video(gen_img_config.ctrl_img_1):
+                        # control VIDEO: pass the path through; models with
+                        # supports_video_control_images handle it in get_prompt_embeds
+                        ctrl_img_list.append(str(gen_img_config.ctrl_img_1))
+                    elif gen_img_config.ctrl_img_1 is not None:
                         ctrl_img_1 = Image.open(gen_img_config.ctrl_img_1).convert("RGB")
                         # convert to 0 to 1 tensor
                         ctrl_img_1 = (
@@ -176,7 +208,11 @@ class SDTrainer(BaseSDTrainProcess):
                             .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
                         )
                         ctrl_img_list.append(ctrl_img_1)
-                    if gen_img_config.ctrl_img_2 is not None:
+                    if gen_img_config.ctrl_img_2 is not None and _is_ctrl_video(gen_img_config.ctrl_img_2):
+                        # control VIDEO: pass the path through; models with
+                        # supports_video_control_images handle it in get_prompt_embeds
+                        ctrl_img_list.append(str(gen_img_config.ctrl_img_2))
+                    elif gen_img_config.ctrl_img_2 is not None:
                         ctrl_img_2 = Image.open(gen_img_config.ctrl_img_2).convert("RGB")
                         # convert to 0 to 1 tensor
                         ctrl_img_2 = (
@@ -185,7 +221,11 @@ class SDTrainer(BaseSDTrainProcess):
                             .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
                         )
                         ctrl_img_list.append(ctrl_img_2)
-                    if gen_img_config.ctrl_img_3 is not None:
+                    if gen_img_config.ctrl_img_3 is not None and _is_ctrl_video(gen_img_config.ctrl_img_3):
+                        # control VIDEO: pass the path through; models with
+                        # supports_video_control_images handle it in get_prompt_embeds
+                        ctrl_img_list.append(str(gen_img_config.ctrl_img_3))
+                    elif gen_img_config.ctrl_img_3 is not None:
                         ctrl_img_3 = Image.open(gen_img_config.ctrl_img_3).convert("RGB")
                         # convert to 0 to 1 tensor
                         ctrl_img_3 = (
@@ -259,24 +299,18 @@ class SDTrainer(BaseSDTrainProcess):
         
         # cache unconditional embeds (blank prompt)
         with torch.no_grad():
-            kwargs = {}
-            if self.sd.encode_control_in_text_embeddings:
-                # just do a blank image for unconditionals
-                control_image = torch.zeros((1, 3, 224, 224), device=self.sd.device_torch, dtype=self.sd.torch_dtype)
-                if self.sd.has_multiple_control_images:
-                    control_image = [control_image]
-                
-                kwargs['control_images'] = control_image
-            self.unconditional_embeds = self.sd.encode_prompt(
+            self.unconditional_embeds = self.encode_static_prompt(
                 [self.train_config.unconditional_prompt],
                 long_prompts=self.do_long_prompts,
-                **kwargs
             ).to(
                 self.device_torch,
                 dtype=self.sd.torch_dtype
             ).detach()
         
         if self.train_config.do_prior_divergence:
+            self.do_prior_prediction = True
+        if getattr(self.sd, 'dopsd_self_ref', False):
+            # D-OPSD: the teacher (prior) prediction is the training target
             self.do_prior_prediction = True
         # move vae to device if we did not cache latents
         if not self.is_latents_cached:
@@ -324,18 +358,11 @@ class SDTrainer(BaseSDTrainProcess):
                     raise ValueError("Cannot unload text encoder if training text encoder")
                 # cache embeddings
                 self.sd.text_encoder_to(self.device_torch)
-                encode_kwargs = {}
-                if self.sd.encode_control_in_text_embeddings:
-                    # just do a blank image for unconditionals
-                    control_image = torch.zeros((1, 3, 224, 224), device=self.sd.device_torch, dtype=self.sd.torch_dtype)
-                    if self.sd.has_multiple_control_images:
-                        control_image = [control_image]
-                    encode_kwargs['control_images'] = control_image
-                self.cached_blank_embeds = self.sd.encode_prompt("", **encode_kwargs)
+                self.cached_blank_embeds = self.encode_static_prompt("")
                 if self.trigger_word is not None:
-                    self.cached_trigger_embeds = self.sd.encode_prompt(self.trigger_word, **encode_kwargs)
+                    self.cached_trigger_embeds = self.encode_static_prompt(self.trigger_word)
                 if self.train_config.diff_output_preservation:
-                    self.cached_dop_class_embeds = self.sd.encode_prompt(self.train_config.diff_output_preservation_class)
+                    self.cached_dop_class_embeds = self.encode_static_prompt(self.train_config.diff_output_preservation_class)
                     self.diff_output_preservation_embeds = self.cached_dop_class_embeds
                 
                 self.cache_sample_prompts()
@@ -992,6 +1019,8 @@ class SDTrainer(BaseSDTrainProcess):
         if batch.audio_pred is not None and batch.audio_target is not None:
             audio_loss = torch.nn.functional.mse_loss(batch.audio_pred.float(), batch.audio_target.float(), reduction="mean")
             audio_loss = audio_loss * self.train_config.audio_loss_multiplier
+            self.additional_logs['loss/img'] = loss.item()
+            self.additional_logs['loss/audio'] = audio_loss.item()
             loss = loss + audio_loss
 
         # check for additional losses
@@ -1925,6 +1954,18 @@ class SDTrainer(BaseSDTrainProcess):
                     else:
                         self.adapter.set_reference_images(None)
 
+                if self.train_config.do_guidance_loss and isinstance(self.train_config.guidance_loss_target, list):
+                    batch_size = noisy_latents.shape[0]
+                    # update the guidance value, random float between guidance_loss_target[0] and guidance_loss_target[1]
+                    # sample before the prior prediction so the prior, main, uncond, and
+                    # preservation passes all run at the same guidance values
+                    self._guidance_loss_target_batch = [
+                        random.uniform(
+                            self.train_config.guidance_loss_target[0],
+                            self.train_config.guidance_loss_target[1]
+                        ) for _ in range(batch_size)
+                    ]
+
                 prior_pred = None
 
                 do_inverted_masked_prior = False
@@ -1957,6 +1998,19 @@ class SDTrainer(BaseSDTrainProcess):
                                 [blank_embeds] * noisy_latents.shape[0]
                             )
                         
+                        is_dopsd = getattr(self.sd, 'dopsd_self_ref', False)
+                        if is_dopsd:
+                            # teacher embeds: caption + vision block naming the item as its own reference
+                            if batch.dopsd_prompt_embeds is None:
+                                raise ValueError(
+                                    "D-OPSD requires cached text embeddings; enable "
+                                    "train.cache_text_embeddings"
+                                )
+                            prior_embeds_to_use = batch.dopsd_prompt_embeds.clone().detach().to(
+                                self.device_torch, dtype=dtype
+                            )
+                            batch.dopsd_teacher_pass = True
+
                         # joint audio models stash their audio pred on the batch.
                         # Give this pass its own slot so the preservation loss
                         # can pair it with the preservation pass below.
@@ -1974,6 +2028,11 @@ class SDTrainer(BaseSDTrainProcess):
                             conditioned_prompts=conditioned_prompts
                         )
                         batch.audio_pred_slot = None
+                        if is_dopsd:
+                            batch.dopsd_teacher_pass = False
+                            if batch.audio_pred_prior is not None:
+                                # the teacher's audio prediction is the audio target too
+                                batch.audio_target = batch.audio_pred_prior.detach()
                         if prior_pred is not None:
                             prior_pred = prior_pred.detach()
 
@@ -2032,16 +2091,6 @@ class SDTrainer(BaseSDTrainProcess):
                                 pred_kwargs['down_block_additional_residuals'] = down_block_res_samples
                                 pred_kwargs['mid_block_additional_residual'] = mid_block_res_sample
                 
-                if self.train_config.do_guidance_loss and isinstance(self.train_config.guidance_loss_target, list):
-                    batch_size = noisy_latents.shape[0]
-                    # update the guidance value, random float between guidance_loss_target[0] and guidance_loss_target[1]
-                    self._guidance_loss_target_batch = [
-                        random.uniform(
-                            self.train_config.guidance_loss_target[0],
-                            self.train_config.guidance_loss_target[1]
-                        ) for _ in range(batch_size)
-                    ]
-
                 self.before_unet_predict()
                 
                 if unconditional_embeds is not None:
